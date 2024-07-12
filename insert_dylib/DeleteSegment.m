@@ -228,8 +228,101 @@ bool delete_dylib(
             }
         }
     } else {
+        printf("\n\n====================\isFat else \n");
+
         //如果是 thin 版本，就直接从上面fat版处理步骤中的 "开始读取 mach header" 开始,这里就不再重复实现了。
-        assert(false);
+//        assert(false);
+        uint64_t machHeaderOffset = 0;
+
+        /*------ 开始读取 mach header ------*/
+        //读取魔数(前4个字节)
+        uint32 machMagic = *((uint32 *) [machoFileHandle readBytesFromOffSet:machHeaderOffset length:4]);
+        BOOL isMach64 = isMagic64(machMagic);
+        BOOL shoudMachSwap = shouldSwapBytesOfMagic(machMagic);
+
+        int ncmds = 0;
+        long loadCommandsOffset = 0;
+        if (isMach64) {
+            int machHeaderSize = sizeof(struct mach_header_64);
+            struct mach_header_64 *header = (struct mach_header_64 *) [machoFileHandle readBytesFromOffSet:machHeaderOffset length:machHeaderSize];
+            if (shoudMachSwap) {
+                swap_mach_header_64(header, 0);
+            }
+            //获取 load commands 的个数
+            ncmds = header->ncmds;
+            //load commands的起始位置
+            loadCommandsOffset = machHeaderOffset + machHeaderSize;
+        } else {
+            int machHeaderSize = sizeof(struct mach_header);
+            struct mach_header *header = (struct mach_header *) [machoFileHandle readBytesFromOffSet:machHeaderOffset length:machHeaderSize];
+            if (shoudMachSwap) {
+                swap_mach_header(header, 0);
+            }
+
+            ncmds = header->ncmds;
+            loadCommandsOffset = machHeaderOffset + machHeaderSize;
+        }
+        /*------ 开始读取 load command ------*/
+        for (int i = 0; i < ncmds; i++) {
+            struct load_command *cmd = (struct load_command *) [machoFileHandle readBytesFromOffSet:loadCommandsOffset length:sizeof(struct load_command)];
+            if (shoudMachSwap) {
+                swap_load_command(cmd, 0);
+            }
+            //如果是 LC_LOAD_DYLIB类型， 则获取 dylib_command
+            if (cmd->cmd == LC_LOAD_DYLIB) {
+                struct dylib_command *dylibCmd = (struct dylib_command *) [machoFileHandle readBytesFromOffSet:loadCommandsOffset length:cmd->cmdsize];
+                if (shoudMachSwap) {
+                    swap_dylib_command(dylibCmd, 0);
+                }
+                //读取 dylib_command 的 name 信息
+                int pathstringLen = dylibCmd->cmdsize - dylibCmd->dylib.name.offset;
+                char *cPath = (char *) [machoFileHandle readBytesFromOffSet:loadCommandsOffset + dylibCmd->dylib.name.offset length:pathstringLen];
+                NSString *path = [[NSString alloc] initWithUTF8String:cPath];
+                NSLog(@"loading... %@", path);
+                if ([path isEqualToString:toDeleteDylibLink]) {
+                    int totalCmdSize = 0;
+                    int machHeaderSize = 0;
+                    /* 执行删除逻辑 */
+                    //更新 header 信息
+                    if (isMach64) {
+                        machHeaderSize = sizeof(struct mach_header_64);
+                        struct mach_header_64 *header = (struct mach_header_64 *) [machoFileHandle readBytesFromOffSet:machHeaderOffset length:machHeaderSize];
+                        if (shoudMachSwap) {
+                            swap_mach_header_64(header, 0);
+                        }
+
+                        totalCmdSize = header->sizeofcmds;
+                        header->ncmds -= 1;
+                        header->sizeofcmds -= dylibCmd->cmdsize;
+                        [machoFileHandle writeBytes:header offSet:machHeaderOffset length:machHeaderSize];
+                    } else {
+                        machHeaderSize = sizeof(struct mach_header);
+                        struct mach_header *header = (struct mach_header *) [machoFileHandle readBytesFromOffSet:machHeaderOffset length:machHeaderSize];
+                        if (shoudMachSwap) {
+                            swap_mach_header(header, 0);
+                        }
+                        totalCmdSize = header->sizeofcmds;
+                        header->ncmds -= 1;
+                        header->sizeofcmds -= dylibCmd->cmdsize;
+                        [machoFileHandle writeBytes:header offSet:machHeaderOffset length:machHeaderSize];
+                    }
+                    //构建 0 字节
+                    int n = dylibCmd->cmdsize;
+                    uint8 *arr;
+                    arr = (uint8 *) malloc(sizeof(uint8) * n);
+                    for (int i = 0; i < n; i++)
+                        arr[i] = 0;
+                    //尾部添加
+                    [NSFileHandle insert:machoFilePath toInsertData:[NSData dataWithBytes:arr length:n] offset:machHeaderOffset + machHeaderSize + totalCmdSize];
+                    //删除 dylibCmd 占用的字节
+                    [NSFileHandle delete:machoFilePath offset:loadCommandsOffset size:dylibCmd->cmdsize];
+                    //如果找到后 就return 退出循环
+                    return true;
+                }
+            }
+            //计算下个 load_command 的起始位置
+            loadCommandsOffset += cmd->cmdsize;
+        }
     }
 
     return 0;
